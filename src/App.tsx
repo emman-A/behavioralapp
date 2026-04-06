@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react'
 import rawQuestions from './data/questions.json'
+import { normalizeAnswerText } from './lib/normalizeAnswer'
 
 export interface Story {
   title: string
@@ -42,6 +43,24 @@ const TAB_STYLES = [
   'bg-amber-600 text-white border-amber-600',
 ]
 
+const MAX_WRONG_BEFORE_REVEAL = 3
+
+type SentenceRecallState = {
+  input: string
+  wrongCount: number
+  solved: boolean
+  revealed: boolean
+}
+
+function buildInitialSentenceStates(n: number): SentenceRecallState[] {
+  return Array.from({ length: n }, () => ({
+    input: '',
+    wrongCount: 0,
+    solved: false,
+    revealed: false,
+  }))
+}
+
 function shuffle<T>(arr: T[]): T[] {
   const a = [...arr]
   for (let i = a.length - 1; i > 0; i--) {
@@ -53,6 +72,12 @@ function shuffle<T>(arr: T[]): T[] {
 
 function isFlowCard(c: Card): c is Extract<Card, { sentences: string[] }> {
   return Array.isArray((c as { sentences?: string[] }).sentences)
+}
+
+/** First index that still needs typing (not solved and not revealed). */
+function activeSentenceIndex(states: SentenceRecallState[]): number {
+  const i = states.findIndex(s => !s.solved && !s.revealed)
+  return i === -1 ? states.length : i
 }
 
 function QuestionPanel({
@@ -95,94 +120,182 @@ function QuestionPanel({
   )
 }
 
-function SentenceFlow({
+function SentenceRecall({
   sentences,
-  revealedCount,
-  onRevealNext,
-  onRevealAll,
-  onReset,
+  states,
+  setStates,
+  onProgress,
 }: {
   sentences: string[]
-  revealedCount: number
-  onRevealNext: () => void
-  onRevealAll: () => void
-  onReset: () => void
+  states: SentenceRecallState[]
+  setStates: Dispatch<SetStateAction<SentenceRecallState[]>>
+  onProgress: () => void
 }) {
+  const inputRef = useRef<HTMLTextAreaElement | null>(null)
+  const active = activeSentenceIndex(states)
   const n = sentences.length
-  const nextIndex = revealedCount
-  const allRevealed = revealedCount >= n
+  const solvedCount = states.filter(s => s.solved).length
+  const allDone = n > 0 && states.every(s => s.solved || s.revealed)
+
+  useEffect(() => {
+    if (active < n && inputRef.current && !states[active]?.solved && !states[active]?.revealed) {
+      inputRef.current.focus()
+    }
+  }, [active, n, states])
+
+  const checkActive = useCallback(() => {
+    if (active >= n) return
+    const expected = sentences[active]
+    if (expected === undefined) return
+    setStates(prev => {
+      const row = prev[active]
+      if (!row || row.solved || row.revealed) return prev
+      const ok = normalizeAnswerText(row.input) === normalizeAnswerText(expected)
+      if (ok) {
+        onProgress()
+        const next = [...prev]
+        next[active] = { ...row, solved: true, input: expected }
+        return next
+      }
+      const wrongCount = row.wrongCount + 1
+      const revealNow = wrongCount >= MAX_WRONG_BEFORE_REVEAL
+      const next = [...prev]
+      next[active] = {
+        ...row,
+        wrongCount,
+        revealed: revealNow,
+        ...(revealNow ? { input: expected } : {}),
+      }
+      if (revealNow) onProgress()
+      return next
+    })
+  }, [active, n, sentences, setStates, onProgress])
+
+  const setInput = (i: number, value: string) => {
+    setStates(prev => {
+      const row = prev[i]
+      if (!row || row.solved || row.revealed) return prev
+      const next = [...prev]
+      next[i] = { ...row, input: value }
+      return next
+    })
+  }
+
+  const resetAll = () => {
+    setStates(buildInitialSentenceStates(n))
+  }
 
   return (
     <div className="rounded-2xl border border-indigo-200 bg-white shadow-md overflow-hidden">
       <div className="px-4 py-3 border-b border-indigo-100 bg-indigo-50/80 flex flex-wrap items-center justify-between gap-2">
-        <h2 className="text-xs font-bold uppercase tracking-wide text-indigo-800">Your answer — one sentence at a time</h2>
+        <h2 className="text-xs font-bold uppercase tracking-wide text-indigo-800">Your answer — type each sentence</h2>
         <span className="text-xs font-semibold text-indigo-600">
-          {revealedCount} / {n} shown
+          {solvedCount} / {n} exact
         </span>
       </div>
 
       <div className="px-4 py-4 space-y-3">
-        {sentences.map((s, i) => {
-          const shown = i < revealedCount
-          if (shown) {
+        {sentences.map((expected, i) => {
+          const st = states[i]
+          if (!st) return null
+
+          if (st.solved) {
             return (
               <div
                 key={i}
-                className="rounded-xl border border-emerald-200 bg-emerald-50/70 px-3 py-2.5 text-sm leading-relaxed text-slate-800"
+                className="rounded-xl border border-emerald-300 bg-emerald-50/80 px-3 py-2.5 text-sm leading-relaxed text-slate-800"
               >
-                <span className="text-[10px] font-bold text-emerald-700 mr-2">{i + 1}.</span>
-                {s}
+                <div className="flex items-center gap-2 mb-1">
+                  <span className="text-[10px] font-bold text-emerald-800">{i + 1}.</span>
+                  <span className="text-[10px] font-bold uppercase text-emerald-700">Correct</span>
+                </div>
+                {expected}
               </div>
             )
           }
-          const isNext = i === nextIndex
+
+          if (st.revealed && !st.solved) {
+            return (
+              <div
+                key={i}
+                className="rounded-xl border border-amber-300 bg-amber-50/90 px-3 py-2.5 text-sm leading-relaxed text-slate-800"
+              >
+                <div className="flex items-center gap-2 mb-1">
+                  <span className="text-[10px] font-bold text-amber-900">{i + 1}.</span>
+                  <span className="text-[10px] font-bold uppercase text-amber-800">Shown after {MAX_WRONG_BEFORE_REVEAL} tries</span>
+                </div>
+                {expected}
+              </div>
+            )
+          }
+
+          const isActive = i === active
+          const locked = !isActive
+
           return (
-            <button
+            <div
               key={i}
-              type="button"
-              onClick={() => {
-                if (isNext) onRevealNext()
-              }}
-              disabled={!isNext}
-              className={`w-full text-left rounded-xl border-2 border-dashed px-3 py-3 min-h-[3rem] transition-colors ${
-                isNext
-                  ? 'border-amber-400 bg-amber-50/90 hover:bg-amber-100 cursor-pointer'
-                  : 'border-slate-200 bg-slate-50/80 opacity-70 cursor-not-allowed'
+              className={`rounded-xl border-2 px-3 py-3 ${
+                isActive ? 'border-indigo-300 bg-indigo-50/40' : 'border-slate-200 bg-slate-50/60 opacity-80'
               }`}
             >
-              <span className="text-[10px] font-bold text-slate-500 mr-2">{i + 1}.</span>
-              <span className="text-sm text-slate-400 italic">
-                {isNext ? 'Tap here or use “Reveal next” / Space — what’s your next sentence?' : 'Hidden until previous lines are revealed'}
-              </span>
-            </button>
+              <div className="flex items-center justify-between gap-2 mb-2">
+                <span className="text-[10px] font-bold text-slate-600">Sentence {i + 1}</span>
+                {st.wrongCount > 0 && (
+                  <span className="text-[10px] font-medium text-rose-600">
+                    {st.wrongCount} / {MAX_WRONG_BEFORE_REVEAL} tries
+                  </span>
+                )}
+              </div>
+              <textarea
+                ref={isActive ? inputRef : undefined}
+                value={st.input}
+                onChange={e => {
+                  if (!locked) setInput(i, e.target.value)
+                }}
+                onKeyDown={e => {
+                  if (locked) return
+                  if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault()
+                    checkActive()
+                  }
+                }}
+                disabled={locked}
+                rows={3}
+                placeholder={
+                  locked
+                    ? 'Finish the sentence above first…'
+                    : 'Type this sentence from memory, then Check or Enter…'
+                }
+                className="w-full text-sm rounded-lg border border-slate-200 bg-white px-3 py-2 text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-400 disabled:cursor-not-allowed disabled:bg-slate-100"
+              />
+              {isActive && (
+                <div className="mt-2 flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={checkActive}
+                    className="text-xs font-semibold px-4 py-2 rounded-full border border-indigo-500 bg-indigo-600 text-white hover:bg-indigo-700"
+                  >
+                    Check
+                  </button>
+                </div>
+              )}
+            </div>
           )
         })}
       </div>
 
-      <div className="px-4 pb-4 flex flex-wrap gap-2">
+      <div className="px-4 pb-4 flex flex-wrap items-center gap-2 border-t border-slate-100 pt-3">
         <button
           type="button"
-          disabled={allRevealed}
-          onClick={onRevealNext}
-          className="text-xs font-semibold px-4 py-2 rounded-full border border-indigo-500 bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-40 disabled:cursor-not-allowed"
-        >
-          Reveal next sentence
-        </button>
-        <button
-          type="button"
-          disabled={allRevealed}
-          onClick={onRevealAll}
-          className="text-xs font-semibold px-4 py-2 rounded-full border border-emerald-300 bg-emerald-50 text-emerald-900 hover:bg-emerald-100 disabled:opacity-40 disabled:cursor-not-allowed"
-        >
-          Reveal all
-        </button>
-        <button
-          type="button"
-          onClick={onReset}
+          onClick={resetAll}
           className="text-xs font-semibold px-4 py-2 rounded-full border border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
         >
-          Hide all · restart
+          Reset drill
         </button>
+        {allDone && (
+          <span className="text-xs font-semibold text-emerald-700">All sentences done — move to next card or reset.</span>
+        )}
       </div>
     </div>
   )
@@ -200,7 +313,7 @@ export default function App() {
   const [idx, setIdx] = useState(0)
   const [storyTab, setStoryTab] = useState(0)
   const [visited, setVisited] = useState<Set<number>>(() => new Set())
-  const [revealedSentenceCount, setRevealedSentenceCount] = useState(0)
+  const [sentenceStates, setSentenceStates] = useState<SentenceRecallState[]>([])
 
   const deck = useMemo(() => {
     const f = cat === 'All' ? all : all.filter(q => q.category === cat)
@@ -209,15 +322,22 @@ export default function App() {
 
   const card = deck[idx] ?? null
 
+  const markTouched = useCallback(() => {
+    if (card && isFlowCard(card)) setVisited(v => new Set(v).add(card.id))
+  }, [card])
+
   useEffect(() => {
     setIdx(0)
     setStoryTab(0)
-    setRevealedSentenceCount(0)
   }, [cat, shuffled, deck.length])
 
   useEffect(() => {
-    setRevealedSentenceCount(0)
     setStoryTab(0)
+    if (card && isFlowCard(card)) {
+      setSentenceStates(buildInitialSentenceStates(card.sentences.length))
+    } else {
+      setSentenceStates([])
+    }
   }, [card?.id])
 
   const go = useCallback(
@@ -225,43 +345,20 @@ export default function App() {
       if (!deck.length) return
       setIdx(i => (i + d + deck.length) % deck.length)
       setStoryTab(0)
-      setRevealedSentenceCount(0)
     },
     [deck.length]
   )
 
-  const revealNext = useCallback(() => {
-    if (!card || !isFlowCard(card)) return
-    setRevealedSentenceCount(c => {
-      const next = Math.min(c + 1, card.sentences.length)
-      if (next > 0) setVisited(v => new Set(v).add(card.id))
-      return next
-    })
-  }, [card])
-
-  const revealAll = useCallback(() => {
-    if (!card || !isFlowCard(card)) return
-    setRevealedSentenceCount(card.sentences.length)
-    setVisited(v => new Set(v).add(card.id))
-  }, [card])
-
-  const resetFlow = useCallback(() => setRevealedSentenceCount(0), [])
-
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if ((e.target as HTMLElement)?.tagName === 'INPUT' || (e.target as HTMLElement)?.tagName === 'TEXTAREA') return
+      const t = e.target as HTMLElement
+      if (t?.tagName === 'INPUT' || t?.tagName === 'TEXTAREA') return
       if (e.key === 'ArrowRight') go(1)
       if (e.key === 'ArrowLeft') go(-1)
-      if (e.key === ' ' || e.key === 'Enter') {
-        if (card && isFlowCard(card) && revealedSentenceCount < card.sentences.length) {
-          e.preventDefault()
-          revealNext()
-        }
-      }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [go, card, revealedSentenceCount, revealNext])
+  }, [go])
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-slate-50 to-slate-100 text-slate-900 pb-12">
@@ -269,7 +366,8 @@ export default function App() {
         <div className="max-w-2xl mx-auto px-4 py-4">
           <h1 className="text-xl font-black tracking-tight text-indigo-700">Behavioural Game Mastery</h1>
           <p className="text-xs text-slate-500 mt-0.5">
-            Question stays visible · reveal your answer sentence by sentence · Space = next sentence · ← → = cards
+            Question stays visible · type each sentence · Check (or Enter) must match · after {MAX_WRONG_BEFORE_REVEAL} misses
+            the answer shows · ← → switch cards
           </p>
         </div>
       </header>
@@ -317,12 +415,11 @@ export default function App() {
             <QuestionPanel category={card.category} label={card.label} question={card.question} cues={card.cues} />
 
             {isFlowCard(card) ? (
-              <SentenceFlow
+              <SentenceRecall
                 sentences={card.sentences}
-                revealedCount={revealedSentenceCount}
-                onRevealNext={revealNext}
-                onRevealAll={revealAll}
-                onReset={resetFlow}
+                states={sentenceStates}
+                setStates={setSentenceStates}
+                onProgress={markTouched}
               />
             ) : (
               <div className="rounded-2xl border border-indigo-200 bg-white shadow-md overflow-hidden">
@@ -375,9 +472,8 @@ export default function App() {
       </main>
 
       <footer className="max-w-2xl mx-auto px-4 py-6 text-center text-[11px] text-slate-400">
-        Edit <code className="bg-slate-200/80 px-1 rounded">src/data/questions.json</code> —{' '}
-        <code className="bg-slate-200/80 px-1 rounded">sentences</code> is an array of strings (one flow step each). Legacy
-        STAR: <code className="bg-slate-200/80 px-1 rounded">stories</code>.
+        Checks follow Leet Game (Line Game) rules: trimmed text, collapsed spaces. Edit{' '}
+        <code className="bg-slate-200/80 px-1 rounded">src/data/questions.json</code>.
       </footer>
     </div>
   )
